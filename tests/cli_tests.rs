@@ -1395,12 +1395,15 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn test_wasm_info_displays_contract_meta() {
     // Extend the bare fixture with a contractmeta section and point wasm-info
-    // at it: name/version/description must be shown (table and JSON modes).
+    // at it: name/version/description/author/SDK version must be shown
+    // (table and JSON modes).
     let mut bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let mut payload = Vec::new();
     payload.extend_from_slice(&xdr_meta_entry("name", "MetaContract"));
     payload.extend_from_slice(&xdr_meta_entry("version", "9.9.9"));
     payload.extend_from_slice(&xdr_meta_entry("description", "A meta description"));
+    payload.extend_from_slice(&xdr_meta_entry("author", "Stellar Dev"));
+    payload.extend_from_slice(&xdr_meta_entry("rs_sdk_version", "25.3.2"));
     bytes.extend_from_slice(&custom_section("contractmetav0", &payload));
 
     let home = temp_home("wasm-info-meta");
@@ -1416,6 +1419,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert!(stdout.contains("name: MetaContract"));
     assert!(stdout.contains("version: 9.9.9"));
     assert!(stdout.contains("description: A meta description"));
+    assert!(stdout.contains("author: Stellar Dev"));
+    assert!(stdout.contains("sdk_version: 25.3.2"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["wasm-info", "--wasm", path.to_str().unwrap(), "--json"])
@@ -1430,6 +1435,8 @@ fn test_wasm_info_displays_contract_meta() {
     assert_eq!(parsed["contract_meta"]["name"], "MetaContract");
     assert_eq!(parsed["contract_meta"]["version"], "9.9.9");
     assert_eq!(parsed["contract_meta"]["description"], "A meta description");
+    assert_eq!(parsed["contract_meta"]["author"], "Stellar Dev");
+    assert_eq!(parsed["contract_meta"]["sdk_version"], "25.3.2");
 }
 
 #[test]
@@ -2952,4 +2959,367 @@ fn test_estimate_project_invalid_input_error() {
         stderr.contains("duplicate projection count: 100"),
         "stderr should mention duplicate count: {stderr}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// assert_cmd / predicates end-to-end coverage (#353)
+//
+// The sections above drive the binary with `std::process::Command`. This
+// section exercises the same behaviors through `assert_cmd` and asserts
+// with `predicates`, per the e2e-suite issue. Everything stays offline:
+// positive paths use commands that never touch the network (`--dry-run`,
+// `wasm-info`, `completions`, `config diff --against-previous`,
+// `cache stats`) or an isolated temp `HOME`, while negative paths rely on
+// argument validation or a dead local RPC endpoint.
+// ─────────────────────────────────────────────────────────────────────────
+
+use predicates::prelude::*;
+
+/// The real CLI binary as an `assert_cmd::Command`.
+fn cargo_cmd() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("soroban-cost-estimator")
+        .unwrap_or_else(|e| panic!("failed to locate soroban-cost-estimator binary: {e}"))
+}
+
+/// The CLI binary with `HOME` isolated and tracing silenced, so assertions
+/// see only the command's own output.
+fn cargo_cmd_in_home(home: &Path) -> assert_cmd::Command {
+    let mut cmd = cargo_cmd();
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error");
+    cmd
+}
+
+#[test]
+fn test_assert_cmd_estimate_dry_run_succeeds_offline() {
+    // A fully valid `estimate` invocation that never contacts the network:
+    // `--dry-run` prints the planned payload and exits 0. This is the
+    // end-to-end happy path for argument parsing, WASM loading, envelope
+    // construction, and table output in one test.
+    cargo_cmd()
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--dry-run",
+        ])
+        .env("RUST_LOG", "error")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Dry run"))
+        .stdout(predicates::str::contains("WASM SHA-256"))
+        .stderr(predicates::str::is_empty());
+}
+
+#[test]
+fn test_assert_cmd_estimate_dry_run_accepts_piped_stdin() {
+    // The estimator never reads stdin; piping (closed) stdin must not block
+    // or change the result — the same output as an interactive run.
+    cargo_cmd()
+        .args([
+            "estimate",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--dry-run",
+        ])
+        .env("RUST_LOG", "error")
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Dry run"))
+        .stderr(predicates::str::is_empty());
+}
+
+#[test]
+fn test_assert_cmd_estimate_missing_wasm_exit_code_and_stderr() {
+    // tracing's log lines share stdout in this binary, so only stderr and
+    // the exit code are asserted here.
+    cargo_cmd()
+        .args(["estimate", "--wasm", "no/such/file.wasm"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("File not found"));
+}
+
+#[test]
+fn test_assert_cmd_estimate_invalid_wasm_bytes_fail_validation() {
+    let home = temp_home("assert-cmd-invalid-wasm");
+    let bogus = home.join("bogus.wasm");
+    std::fs::write(&bogus, b"definitely not a wasm module").expect("write fixture");
+
+    cargo_cmd()
+        .args(["estimate", "--wasm", bogus.to_str().expect("utf-8 path")])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("failed to validate WASM"));
+}
+
+#[test]
+fn test_assert_cmd_invalid_network_names_rejected_everywhere() {
+    // The same unknown network name must fail identically on every
+    // network-touching subcommand, before any request is sent.
+    for args in [
+        vec![
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--network",
+            "not-a-network",
+        ],
+        vec![
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--network",
+            "not-a-network",
+        ],
+        vec!["config", "snapshot", "--network", "not-a-network"],
+    ] {
+        cargo_cmd()
+            .args(&args)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicates::str::contains(
+                "failed to locate RPC endpoint: not configured for network not-a-network",
+            ));
+    }
+}
+
+#[test]
+fn test_assert_cmd_invalid_numeric_arguments_rejected() {
+    // clap rejects malformed numbers with a usage error (exit 2) before the
+    // command logic runs.
+    cargo_cmd()
+        .args(["estimate", "--wasm", "x.wasm", "--rps", "abc"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("invalid value"));
+
+    cargo_cmd()
+        .args(["estimate", "--wasm", "x.wasm", "--timeout", "not-a-number"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("invalid value"));
+
+    // `--precision` parses as a number but its 0..=7 range must reject 99.
+    cargo_cmd()
+        .args(["estimate", "--wasm", "x.wasm", "--precision", "99"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("invalid value"));
+}
+
+#[test]
+fn test_assert_cmd_estimate_all_valid_flags_dead_rpc() {
+    // All flag combinations are valid; the failure comes solely from the
+    // unreachable endpoint — proving the flags parse end to end.
+    for extra in [
+        vec!["--json"],
+        vec!["--format", "json"],
+        vec!["--format", "csv"],
+        vec!["--format", "markdown"],
+    ] {
+        let mut args = vec![
+            "estimate-all",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ];
+        args.extend(extra);
+        cargo_cmd()
+            .args(&args)
+            .env("RUST_LOG", "error")
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(
+                predicates::str::contains("HTTP request failed")
+                    .or(predicates::str::contains("error sending request")),
+            );
+    }
+}
+
+#[test]
+fn test_assert_cmd_config_snapshot_unknown_network_json() {
+    // `--json` is accepted; the run still fails on the unresolvable network,
+    // never on the flag itself.
+    cargo_cmd()
+        .args(["config", "snapshot", "--network", "not-a-network", "--json"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "not configured for network not-a-network",
+        ));
+}
+
+#[test]
+fn test_assert_cmd_config_diff_against_previous_table_and_json() {
+    let home = temp_home("assert-cmd-diff-prev");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    // Table mode: human-readable diff header for the two newest snapshots.
+    cargo_cmd_in_home(&home)
+        .args([
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("Config diff")
+                .and(predicates::str::contains("ledger 200"))
+                .and(predicates::str::contains("No changes detected")),
+        );
+
+    // JSON mode: the same run emits the machine envelope.
+    let stdout = cargo_cmd_in_home(&home)
+        .args([
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against-previous",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
+    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
+    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
+}
+
+#[test]
+fn test_assert_cmd_config_history_offline() {
+    let home = temp_home("assert-cmd-history");
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
+    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+
+    // Identical snapshots produce a no-changes history without any network
+    // access, even though the network name is unresolvable.
+    cargo_cmd_in_home(&home)
+        .args(["config", "history", "--network", "not-a-network"])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("Config change log")
+                .and(predicates::str::contains("No changes recorded")),
+        );
+}
+
+#[test]
+fn test_assert_cmd_completions_all_shells_piped() {
+    // Completion generation is a pure stdout producer: each shell exits 0,
+    // writes a non-empty script, and works with piped (closed) stdin.
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        cargo_cmd()
+            .args(["completions", shell])
+            .write_stdin("")
+            .assert()
+            .success()
+            .stdout(predicates::str::is_empty().not())
+            .stderr(predicates::str::is_empty());
+    }
+}
+
+#[test]
+fn test_assert_cmd_wasm_info_table_and_json() {
+    // Table mode on the real fixture.
+    cargo_cmd()
+        .args(["wasm-info", "--wasm", "tests/fixtures/contract.wasm"])
+        .env("RUST_LOG", "error")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("WASM"));
+
+    // JSON mode: stdout must be exactly one parseable document, ready to
+    // pipe into another tool.
+    let stdout = cargo_cmd()
+        .args([
+            "wasm-info",
+            "--wasm",
+            "tests/fixtures/contract.wasm",
+            "--json",
+        ])
+        .env("RUST_LOG", "error")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|e| panic!("wasm-info --json must emit valid JSON; {e}: {stdout}"));
+}
+
+#[test]
+fn test_assert_cmd_cache_stats_table_and_json_offline() {
+    let home = temp_home("assert-cmd-cache-stats");
+
+    // Table mode.
+    cargo_cmd_in_home(&home)
+        .args(["cache", "stats"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Cache is empty"));
+
+    // JSON mode on the same empty cache: parseable structured output.
+    let stdout = cargo_cmd_in_home(&home)
+        .args(["cache", "stats", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|e| panic!("cache stats --json must emit valid JSON; {e}: {stdout}"));
+}
+
+#[test]
+fn test_assert_cmd_cache_verify_empty_cache_exit_code() {
+    let home = temp_home("assert-cmd-cache-verify");
+    cargo_cmd_in_home(&home)
+        .args(["cache", "verify"])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("empty").or(predicates::str::contains("nothing to verify")),
+        );
+}
+
+#[test]
+fn test_assert_cmd_unknown_command_exit_code_and_usage() {
+    cargo_cmd()
+        .args(["definitely-not-a-command"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("unrecognized").or(predicates::str::contains("Usage")));
+}
+
+#[test]
+fn test_assert_cmd_no_args_prints_usage_on_stderr() {
+    cargo_cmd()
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Usage"))
+        .stdout(predicates::str::is_empty());
 }
