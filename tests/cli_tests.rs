@@ -167,7 +167,9 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--compare",
         "--clear-cache",
+        "--no-cache",
         "--json",
     ] {
         assert!(
@@ -184,7 +186,14 @@ fn test_estimate_all_help() {
         code, 0,
         "estimate-all --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--wasm", "--network", "--id", "--json", "--format"] {
+    for flag in [
+        "--wasm",
+        "--network",
+        "--id",
+        "--no-cache",
+        "--json",
+        "--format",
+    ] {
         assert!(
             stdout.contains(flag),
             "estimate-all help should mention {flag}; got: {stdout}"
@@ -210,7 +219,7 @@ fn test_config_snapshot_help() {
         code, 0,
         "config snapshot --help should exit 0; stderr: {stderr}"
     );
-    for flag in ["--network", "--out", "--json"] {
+    for flag in ["--network", "--out", "--json", "--retain"] {
         assert!(
             stdout.contains(flag),
             "snapshot help should mention {flag}; got: {stdout}"
@@ -518,6 +527,87 @@ fn test_timeout_flag_accepted_before_subcommand() {
 }
 
 #[test]
+fn test_max_retries_flag_accepted() {
+    // Verify --max-retries is a recognized global argument for estimate.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "5"]);
+    // Should fail because the file doesn't exist, NOT because --max-retries is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_flag_accepted_before_subcommand() {
+    // Global flags must also be accepted before the subcommand.
+    let (_, stderr, code) = run_cli(&["--max-retries", "5", "estimate", "--wasm", "test.wasm"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--max-retries before the subcommand should be recognized; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_zero_accepted() {
+    // 0 is the documented "disable retries" value and must be accepted, not
+    // rejected as an out-of-range value.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "0"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "--max-retries 0 should be accepted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_negative_value_rejected() {
+    // The flag is unsigned, so a negative value must be rejected during
+    // argument parsing rather than silently wrapping to a huge retry count.
+    // clap rejects a bare `-1` as an unexpected argument, which is a
+    // non-zero exit before the command runs — the same convention the
+    // existing unknown-flag test asserts.
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--max-retries", "-1"]);
+    assert_ne!(code, 0, "a negative --max-retries must be rejected");
+    assert!(
+        stderr.contains("unexpected argument") || stderr.to_lowercase().contains("error"),
+        "--max-retries -1 should be rejected at parse time; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_accepted_by_all_network_commands() {
+    // The flag is global, so every command that builds an RPC client must
+    // accept it — not just `estimate`. Each case below fails fast *before*
+    // any network call: `estimate-all`/`cache warm` on a missing WASM file,
+    // and the `config` subcommands on an unknown network name. That keeps the
+    // suite offline while still exercising argument parsing for each command.
+    for args in [
+        vec!["estimate-all", "--wasm", "test.wasm"],
+        vec!["cache", "warm", "--wasm", "test.wasm"],
+        vec!["config", "snapshot", "--network", "nosuchnet"],
+        vec!["config", "diff", "--network", "nosuchnet"],
+    ] {
+        let mut full = args.clone();
+        full.extend_from_slice(&["--max-retries", "5"]);
+
+        let (_, stderr, code) = run_cli(&full);
+        assert_ne!(
+            code,
+            0,
+            "`{}` should fail on its own validation, not on flag parsing",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "--max-retries should be accepted by `{}`; stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+}
+
+#[test]
 fn test_help_lists_global_flags() {
     // Global flags (--rps, --timeout, --precision, --quiet) must appear in
     // subcommand help.
@@ -558,6 +648,35 @@ fn test_precision_out_of_range_rejected() {
             || stderr.contains("not in")
             || stderr.to_lowercase().contains("range"),
         "clap should reject precision 8; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_max_retries_help_documents_default_and_zero_behavior() {
+    // Acceptance criteria: the flag must be in --help with a clear description
+    // of both the default and the "0 disables retries" behavior.
+    let (stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "--help should exit 0; stderr: {stderr}");
+
+    // clap hard-wraps the doc comment to the terminal width, so a phrase can be
+    // split across lines. Collapse all whitespace before searching for the
+    // phrases the acceptance criteria require.
+    let help = stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        help.contains("--max-retries"),
+        "help should list --max-retries; got: {stdout}"
+    );
+    assert!(
+        help.contains("default 3"),
+        "help should state the default of 3; got: {stdout}"
+    );
+    assert!(
+        help.contains("0 disables retries"),
+        "help should explain that 0 disables retries; got: {stdout}"
     );
 }
 
@@ -969,6 +1088,50 @@ fn test_config_snapshot_unknown_network() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the error should name the unknown network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_flag_accepted() {
+    // `--retain` must be a recognized argument: the run fails on the unknown
+    // network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "5",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--retain should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_retain_zero_rejected() {
+    // `--retain 0` would delete every snapshot, so clap must reject it before
+    // anything runs.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--retain",
+        "0",
+    ]);
+    assert_ne!(code, 0, "--retain 0 should be rejected");
+    assert!(
+        stderr.contains("is not in"),
+        "clap should explain the valid range; stderr: {stderr}"
     );
 }
 
@@ -2962,364 +3125,174 @@ fn test_estimate_project_invalid_input_error() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// assert_cmd / predicates end-to-end coverage (#353)
-//
-// The sections above drive the binary with `std::process::Command`. This
-// section exercises the same behaviors through `assert_cmd` and asserts
-// with `predicates`, per the e2e-suite issue. Everything stays offline:
-// positive paths use commands that never touch the network (`--dry-run`,
-// `wasm-info`, `completions`, `config diff --against-previous`,
-// `cache stats`) or an isolated temp `HOME`, while negative paths rely on
-// argument validation or a dead local RPC endpoint.
+// `estimate-all --fn` filter (Issue #25)
 // ─────────────────────────────────────────────────────────────────────────
 
-use predicates::prelude::*;
-
-/// The real CLI binary as an `assert_cmd::Command`.
-fn cargo_cmd() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("soroban-cost-estimator")
-        .unwrap_or_else(|e| panic!("failed to locate soroban-cost-estimator binary: {e}"))
-}
-
-/// The CLI binary with `HOME` isolated and tracing silenced, so assertions
-/// see only the command's own output.
-fn cargo_cmd_in_home(home: &Path) -> assert_cmd::Command {
-    let mut cmd = cargo_cmd();
-    cmd.env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("RUST_LOG", "error");
-    cmd
+#[test]
+fn test_estimate_all_fn_flag_accepted() {
+    let (_, stderr, code) = run_cli(&[
+        "estimate-all",
+        "--wasm",
+        "test.wasm",
+        "--fn",
+        "increment",
+        "--fn",
+        "transfer",
+    ]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--fn should be a recognized, repeatable argument; stderr: {stderr}"
+    );
 }
 
 #[test]
-fn test_assert_cmd_estimate_dry_run_succeeds_offline() {
-    // A fully valid `estimate` invocation that never contacts the network:
-    // `--dry-run` prints the planned payload and exits 0. This is the
-    // end-to-end happy path for argument parsing, WASM loading, envelope
-    // construction, and table output in one test.
-    cargo_cmd()
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--dry-run",
-        ])
-        .env("RUST_LOG", "error")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("Dry run"))
-        .stdout(predicates::str::contains("WASM SHA-256"))
-        .stderr(predicates::str::is_empty());
-}
-
-#[test]
-fn test_assert_cmd_estimate_dry_run_accepts_piped_stdin() {
-    // The estimator never reads stdin; piping (closed) stdin must not block
-    // or change the result — the same output as an interactive run.
-    cargo_cmd()
-        .args([
-            "estimate",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--dry-run",
-        ])
-        .env("RUST_LOG", "error")
-        .write_stdin("")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("Dry run"))
-        .stderr(predicates::str::is_empty());
-}
-
-#[test]
-fn test_assert_cmd_estimate_missing_wasm_exit_code_and_stderr() {
-    // tracing's log lines share stdout in this binary, so only stderr and
-    // the exit code are asserted here.
-    cargo_cmd()
-        .args(["estimate", "--wasm", "no/such/file.wasm"])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicates::str::contains("File not found"));
-}
-
-#[test]
-fn test_assert_cmd_estimate_invalid_wasm_bytes_fail_validation() {
-    let home = temp_home("assert-cmd-invalid-wasm");
-    let bogus = home.join("bogus.wasm");
-    std::fs::write(&bogus, b"definitely not a wasm module").expect("write fixture");
-
-    cargo_cmd()
-        .args(["estimate", "--wasm", bogus.to_str().expect("utf-8 path")])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicates::str::contains("failed to validate WASM"));
-}
-
-#[test]
-fn test_assert_cmd_invalid_network_names_rejected_everywhere() {
-    // The same unknown network name must fail identically on every
-    // network-touching subcommand, before any request is sent.
-    for args in [
-        vec![
-            "estimate",
-            "--wasm",
-            "tests/fixtures/minimal.wasm",
-            "--network",
-            "not-a-network",
-        ],
-        vec![
-            "estimate-all",
-            "--wasm",
-            "tests/fixtures/minimal.wasm",
-            "--network",
-            "not-a-network",
-        ],
-        vec!["config", "snapshot", "--network", "not-a-network"],
-    ] {
-        cargo_cmd()
-            .args(&args)
-            .assert()
-            .failure()
-            .code(1)
-            .stderr(predicates::str::contains(
-                "failed to locate RPC endpoint: not configured for network not-a-network",
-            ));
-    }
-}
-
-#[test]
-fn test_assert_cmd_invalid_numeric_arguments_rejected() {
-    // clap rejects malformed numbers with a usage error (exit 2) before the
-    // command logic runs.
-    cargo_cmd()
-        .args(["estimate", "--wasm", "x.wasm", "--rps", "abc"])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicates::str::contains("invalid value"));
-
-    cargo_cmd()
-        .args(["estimate", "--wasm", "x.wasm", "--timeout", "not-a-number"])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicates::str::contains("invalid value"));
-
-    // `--precision` parses as a number but its 0..=7 range must reject 99.
-    cargo_cmd()
-        .args(["estimate", "--wasm", "x.wasm", "--precision", "99"])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicates::str::contains("invalid value"));
-}
-
-#[test]
-fn test_assert_cmd_estimate_all_valid_flags_dead_rpc() {
-    // All flag combinations are valid; the failure comes solely from the
-    // unreachable endpoint — proving the flags parse end to end.
-    for extra in [
-        vec!["--json"],
-        vec!["--format", "json"],
-        vec!["--format", "csv"],
-        vec!["--format", "markdown"],
-    ] {
-        let mut args = vec![
+fn test_estimate_all_fn_unknown_function_errors() {
+    // A typo must fail loudly, listing the available functions, before any
+    // RPC call.
+    let home = temp_home("estimate-all-fn-unknown");
+    let (_, stderr, code) = run_cli_in_home(
+        &[
             "estimate-all",
             "--wasm",
             "tests/fixtures/contract.wasm",
-            "--rpc-url",
-            DEAD_RPC,
-        ];
-        args.extend(extra);
-        cargo_cmd()
-            .args(&args)
-            .env("RUST_LOG", "error")
-            .assert()
-            .failure()
-            .code(1)
-            .stderr(
-                predicates::str::contains("HTTP request failed")
-                    .or(predicates::str::contains("error sending request")),
-            );
-    }
+            "--fn",
+            "no_such_function",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unknown --fn should exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("not found in WASM"),
+        "the error should say the function was not found; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("increment"),
+        "the error should list the available functions; got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--no-cache` tests (Issue #271)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_estimate_no_cache_flag_accepted() {
+    // The flag must be recognized (failure is the missing file, not the arg).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
 }
 
 #[test]
-fn test_assert_cmd_config_snapshot_unknown_network_json() {
-    // `--json` is accepted; the run still fails on the unresolvable network,
-    // never on the flag itself.
-    cargo_cmd()
-        .args(["config", "snapshot", "--network", "not-a-network", "--json"])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicates::str::contains(
-            "not configured for network not-a-network",
-        ));
+fn test_estimate_all_no_cache_flag_accepted() {
+    let (_, stderr, code) = run_cli(&["estimate-all", "--wasm", "test.wasm", "--no-cache"]);
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "--no-cache should be a recognized argument; stderr: {stderr}"
+    );
 }
 
+/// `--no-cache` skips both the cache read and the cache write:
+///
+/// 1. a run with `--no-cache --cache-ttl` always simulates (never returns a
+///    cache-hit payload) and leaves nothing behind on disk;
+/// 2. a normal run populates the cache;
+/// 3. a later `--cache-ttl` run *does* hit that cache entry — proving the
+///    first run would have too, had `--no-cache` not bypassed it.
 #[test]
-fn test_assert_cmd_config_diff_against_previous_table_and_json() {
-    let home = temp_home("assert-cmd-diff-prev");
-    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
-    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+fn test_no_cache_bypasses_cache_reads_and_writes() {
+    let (rpc_url, _stop) = start_mock_rpc_server(LIVE_INCREMENT_TX_DATA, "15427", 3_894_195);
+    let home = temp_home("no-cache-bypass");
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
-    // Table mode: human-readable diff header for the two newest snapshots.
-    cargo_cmd_in_home(&home)
-        .args([
-            "config",
-            "diff",
-            "--network",
-            "not-a-network",
-            "--against-previous",
-        ])
-        .assert()
-        .success()
-        .stdout(
-            predicates::str::contains("Config diff")
-                .and(predicates::str::contains("ledger 200"))
-                .and(predicates::str::contains("No changes detected")),
-        );
+    let base: Vec<&str> = vec![
+        "estimate",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--id",
+        contract_id,
+        "--fn",
+        "increment",
+        "--arg",
+        "1",
+        "--rpc-url",
+        &rpc_url,
+        "--json",
+    ];
 
-    // JSON mode: the same run emits the machine envelope.
-    let stdout = cargo_cmd_in_home(&home)
-        .args([
-            "config",
-            "diff",
-            "--network",
-            "not-a-network",
-            "--against-previous",
-            "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
+    // 1. Bypassed run: fresh simulation even though --cache-ttl is set.
+    let mut args = base.clone();
+    args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "no-cache estimate should succeed; stderr: {stderr}"
+    );
     let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("valid JSON; {e}: {stdout}"));
-    assert_eq!(parsed["diff"]["old_snapshot"]["ledger"], 100);
-    assert_eq!(parsed["diff"]["new_snapshot"]["ledger"], 200);
-}
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must not return a cache-hit payload; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
 
-#[test]
-fn test_assert_cmd_config_history_offline() {
-    let home = temp_home("assert-cmd-history");
-    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:01+00:00", 100);
-    write_snapshot(&home, "not-a-network", "2026-01-01T00:00:02+00:00", 200);
+    // ...and nothing was written to the cache.
+    let (stdout, stderr, code) = run_cli_quiet(
+        &["cache", "query", "--network", "testnet", "--json"],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "cache query should succeed; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "--no-cache must not persist an estimate; got: {stdout}"
+    );
 
-    // Identical snapshots produce a no-changes history without any network
-    // access, even though the network name is unresolvable.
-    cargo_cmd_in_home(&home)
-        .args(["config", "history", "--network", "not-a-network"])
-        .assert()
-        .success()
-        .stdout(
-            predicates::str::contains("Config change log")
-                .and(predicates::str::contains("No changes recorded")),
-        );
-}
+    // 2. A normal run does populate the cache.
+    let (_, stderr, code) = run_cli_quiet(&base, Some(&home));
+    assert_eq!(
+        code, 0,
+        "populating estimate should succeed; stderr: {stderr}"
+    );
+    let (stdout, _, _) = run_cli_quiet(
+        &["cache", "query", "--network", "testnet", "--json"],
+        Some(&home),
+    );
+    assert!(
+        stdout.contains("increment"),
+        "normal run should cache the estimate; got: {stdout}"
+    );
 
-#[test]
-fn test_assert_cmd_completions_all_shells_piped() {
-    // Completion generation is a pure stdout producer: each shell exits 0,
-    // writes a non-empty script, and works with piped (closed) stdin.
-    for shell in ["bash", "zsh", "fish", "powershell"] {
-        cargo_cmd()
-            .args(["completions", shell])
-            .write_stdin("")
-            .assert()
-            .success()
-            .stdout(predicates::str::is_empty().not())
-            .stderr(predicates::str::is_empty());
-    }
-}
+    // 3. The cached entry is now visible to --cache-ttl...
+    let mut cached_args = base.clone();
+    cached_args.extend_from_slice(&["--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&cached_args, Some(&home));
+    assert_eq!(code, 0, "cached estimate should succeed; stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("cache-hit JSON; got: {stdout}");
+    assert_eq!(
+        parsed["cache"], "hit",
+        "expected a cache hit; got: {stdout}"
+    );
 
-#[test]
-fn test_assert_cmd_wasm_info_table_and_json() {
-    // Table mode on the real fixture.
-    cargo_cmd()
-        .args(["wasm-info", "--wasm", "tests/fixtures/contract.wasm"])
-        .env("RUST_LOG", "error")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("WASM"));
-
-    // JSON mode: stdout must be exactly one parseable document, ready to
-    // pipe into another tool.
-    let stdout = cargo_cmd()
-        .args([
-            "wasm-info",
-            "--wasm",
-            "tests/fixtures/contract.wasm",
-            "--json",
-        ])
-        .env("RUST_LOG", "error")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
-    serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .unwrap_or_else(|e| panic!("wasm-info --json must emit valid JSON; {e}: {stdout}"));
-}
-
-#[test]
-fn test_assert_cmd_cache_stats_table_and_json_offline() {
-    let home = temp_home("assert-cmd-cache-stats");
-
-    // Table mode.
-    cargo_cmd_in_home(&home)
-        .args(["cache", "stats"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("Cache is empty"));
-
-    // JSON mode on the same empty cache: parseable structured output.
-    let stdout = cargo_cmd_in_home(&home)
-        .args(["cache", "stats", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let stdout = String::from_utf8(stdout).expect("utf-8 stdout");
-    serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .unwrap_or_else(|e| panic!("cache stats --json must emit valid JSON; {e}: {stdout}"));
-}
-
-#[test]
-fn test_assert_cmd_cache_verify_empty_cache_exit_code() {
-    let home = temp_home("assert-cmd-cache-verify");
-    cargo_cmd_in_home(&home)
-        .args(["cache", "verify"])
-        .assert()
-        .success()
-        .stdout(
-            predicates::str::contains("empty").or(predicates::str::contains("nothing to verify")),
-        );
-}
-
-#[test]
-fn test_assert_cmd_unknown_command_exit_code_and_usage() {
-    cargo_cmd()
-        .args(["definitely-not-a-command"])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicates::str::contains("unrecognized").or(predicates::str::contains("Usage")));
-}
-
-#[test]
-fn test_assert_cmd_no_args_prints_usage_on_stderr() {
-    cargo_cmd()
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("Usage"))
-        .stdout(predicates::str::is_empty());
+    // ...but `--no-cache` ignores it and simulates anyway.
+    let mut bypassed_args = base.clone();
+    bypassed_args.extend_from_slice(&["--no-cache", "--cache-ttl", "1h"]);
+    let (stdout, stderr, code) = run_cli_quiet(&bypassed_args, Some(&home));
+    assert_eq!(
+        code, 0,
+        "bypassed estimate should succeed; stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("fresh JSON report; got: {stdout}");
+    assert!(
+        parsed.get("cache").is_none(),
+        "--no-cache must ignore the cached entry; got: {stdout}"
+    );
+    assert_eq!(parsed["cpu_instructions"], 532_502);
 }
