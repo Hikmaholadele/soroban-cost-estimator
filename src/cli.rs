@@ -146,10 +146,21 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
+        /// Show the cost difference against the previous cached estimate for
+        /// the same function and arguments (CPU, memory, ledger I/O, and fee).
+        #[arg(long)]
+        compare: bool,
+
         /// Wipe this network's cached estimates before running the
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Bypass the estimate cache entirely: never read a cached estimate
+        /// (including under `--cache-ttl`) and never write the fresh result
+        /// back to disk.
+        #[arg(long)]
+        no_cache: bool,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
@@ -204,6 +215,17 @@ pub enum Command {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+
+        /// Bypass the estimate cache entirely: never read cached estimates
+        /// and never write fresh results back to disk.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Restrict estimation to these function names (repeatable). When
+        /// omitted, every exported function is estimated.
+        #[arg(long = "fn", value_name = "NAME")]
+        fn_names: Vec<String>,
+
         #[arg(long)]
         json: bool,
 
@@ -346,6 +368,13 @@ pub enum ConfigAction {
         network: String,
         #[arg(long)]
         out: Option<String>,
+        /// Automatically delete snapshots older than N days.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        retain: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -385,9 +414,25 @@ pub enum ConfigAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show the chronological change history of every config setting.
+    ///
+    /// Builds a timeline across all saved snapshots, printing one row per
+    /// changed setting with its date, ledger, old value, new value, and
+    /// delta percentage.
     History {
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Filter the timeline to a single setting (matches the raw field
+        /// path, e.g. `contract_compute.fee_rate_per_instructions_increment`,
+        /// or a fragment of it, e.g. `fee_rate_per_instructions_increment`).
+        #[arg(long, value_name = "SETTING")]
+        setting: Option<String>,
+
+        /// Output the timeline as a structured JSON array instead of a
+        /// human-readable table.
+        #[arg(long)]
+        json: bool,
     },
     LastChanged {
         #[arg(long, default_value = "testnet")]
